@@ -1,7 +1,7 @@
 # MAINTAINERS
 
-Mo McElaney - mmcelaney@us.ibm.com
+Ray Valdez - rvaldez@us.ibm.com
 
-JJ Asghar - jja@ibm.com
+Salman Ahmed - sahmed@ibm.com
 
-Brad Topol - btopol@us.ibm.com
+Zhongshu Gu - zgu@us.ibm.com

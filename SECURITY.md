@@ -1,17 +1,9 @@
-# Security Policy
+# Security
 
-## Supported Versions
+## Reporting Security Issues
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+**Please do not report security vulnerabilities through public GitHub issues.**
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+The easiest way to report a security issue is privately through GitHub. See [Privately reporting a security vulnerability](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability#privately-reporting-a-security-vulnerability) for full instructions.
 
-## Reporting a Vulnerability
-
-To report a security issue, please email $VMTalias with a description of the issue, the steps you took to create the issue, affected versions, and if known, mitigations for the issue. Our vulnerability management team will acknowledge receiving your email within 3 working days. This project follows a 90 day disclosure timeline.
+Alternatively, you can report a security issue via e-mail or anonymous form to the IBM Product Security Incident Response Team (PSIRT) following the guidelines under the [IBM Security Vulnerability Management](https://www.ibm.com/support/pages/ibm-security-vulnerability-management) pages.
