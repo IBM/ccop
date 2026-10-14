@@ -202,7 +202,7 @@ Additionally, per-session stream keys are derived from the same HPKE context and
    ```
    $ ccop fetch --url "${KBS_URL}" --auth-key "${KBS_PRIVATE_KEY}" \
    --namespace default --pod pod-busybox-exec \
-   secret_name=ccop_p256 secret_type=p256 --out ./receiver.crt
+   secret_name=ccop_p256 secret_type=cert kind=self_signed_ca algorithm=ec_p256 --out ./receiver.crt
    ```
 
 - Run `ccop exec`, specifying `--privkey` for the user's private key; and  `--pubkeycert` for the pod's public certificate; it successfully executes
