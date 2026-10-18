@@ -20,10 +20,10 @@ import (
 
 // configCmd represents the config command
 var (
-	cliCr         bool
-	cliRe         bool
-	cliList       bool
-	cliPr         bool
+	cliCr   bool
+	cliRe   bool
+	cliList bool
+	cliPr   bool
 
 	configCmd = &cobra.Command{
 		Use:   "config",
