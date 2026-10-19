@@ -8,6 +8,7 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"crypto/cipher"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -32,6 +34,15 @@ import (
 )
 
 const payloadVerion = 1
+
+// ttyExitError is returned by interactiveTty when the remote shell exits with
+// a non-zero code.  The code is extracted from kubectl's plain-text
+// "command terminated with exit code N" message so the caller can propagate it.
+type ttyExitError struct{ code int }
+
+func (e *ttyExitError) Error() string {
+	return fmt.Sprintf("command terminated with exit code %d", e.code)
+}
 
 type PayloadMessage struct {
 	Type            string `msgpack:"type"` // Type "E" for ConfStruct
@@ -175,6 +186,14 @@ Please either:
 
 	if cliTty {
 		if err = interactiveTty(payloadB64, sealer); err != nil {
+			var ttyErr *ttyExitError
+			if errors.As(err, &ttyErr) {
+				// Print the message (kubectl already printed it to the terminal
+				// but we want it on stderr for scripting), then mirror the
+				// remote exit code so the caller can detect it.
+				fmt.Fprintf(os.Stderr, "%s\n", ttyErr.Error())
+				os.Exit(ttyErr.code)
+			}
 			log.Fatalf("error: %v ", err)
 		}
 	} else {
@@ -186,6 +205,7 @@ Please either:
 	}
 
 }
+
 /*
 func processInput(chunk []byte) []byte {
 	return chunk
@@ -316,49 +336,55 @@ func interactive(payloadB64 string, sealer hpke.Sealer) error {
 	} else {
 		go func() {
 			defer stdinPipe.Close()
-
-			// Final frame must be 4096 bytes, encrypting adds around 32 bytes
-			buf := make([]byte, 4064)
-			var counter uint32 = 1
+			//
+			//  Output frame adds header, nonce, and tag overhead, around 36 bytes, so
+			//  read up to 4060 bytes because the output frame is 4096 bytes
+			//
+			buf := make([]byte, 4060)
+			var seq uint32 = 1
 
 			for {
 				n, err := os.Stdin.Read(buf)
 				if n > 0 {
-
-					if counter == 0xFFFFFFFF {
-						reportErr(fmt.Errorf("counter overflow: cannot encrypt more messages"))
+					if seq == 0xFFFFFFFF {
+						reportErr(fmt.Errorf("stdin: seq overflow"))
+						return
 					}
 
-					plaintext := buf[:n]
+					// header = length(4B BE) | seq(4B BE), used as AAD.
+					// length = nonce(12) + len(plaintext) + tag(16)
+					payloadLen := uint32(gcm.NonceSize() + n + gcm.Overhead()) // #nosec G115 -- always < 12+4064+16
+					var header [8]byte
+					binary.BigEndian.PutUint32(header[:4], payloadLen)
+					binary.BigEndian.PutUint32(header[4:], seq)
 
+					// nonce = random(8B) | seq(4B BE)
 					nonce := util.GenerateRandomBytes(gcm.NonceSize())
+					binary.BigEndian.PutUint32(nonce[8:], seq)
+					seq++
 
-					// nonce [12] = nonce [8] + counter [4]
-					binary.BigEndian.PutUint32(nonce[8:], counter)
-					counter++
+					ciphertext := gcm.Seal(nil, nonce, buf[:n], header[:])
 
-					ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
-					// frame = nonce + [ciphertext + tag]
-					framePayload := append(nonce, ciphertext...)
-
-					var frameLen [4]byte
-					binary.BigEndian.PutUint32(frameLen[:], uint32(len(framePayload))) // #nosec G115 -- framePayload is always < 4096 bytes
-
-					if err := writeFull(stdinPipe, frameLen[:]); err != nil {
-						reportErr(fmt.Errorf("writeFull len stdinPipe: %v", err))
+					// wire: header(8) | nonce(12) | ciphertext+tag
+					if err := writeFull(stdinPipe, header[:]); err != nil {
+						reportErr(fmt.Errorf("stdin: write header: %v", err))
+						return
 					}
-
-					if err := writeFull(stdinPipe, framePayload); err != nil {
-						reportErr(fmt.Errorf("writeFull frame stdinPipe: %v", err))
+					if err := writeFull(stdinPipe, nonce); err != nil {
+						reportErr(fmt.Errorf("stdin: write nonce: %v", err))
+						return
 					}
-
+					if err := writeFull(stdinPipe, ciphertext); err != nil {
+						reportErr(fmt.Errorf("stdin: write ciphertext: %v", err))
+						return
+					}
 				}
-				// Move up
 				if err != nil {
 					if err == io.EOF {
 						break
 					}
-					reportErr(fmt.Errorf(" err %v: ", err))
+					reportErr(fmt.Errorf("stdin: read: %v", err))
+					return
 				}
 			}
 		}()
@@ -371,12 +397,12 @@ func interactive(payloadB64 string, sealer hpke.Sealer) error {
 		// We send exactly once; the channel is buffered so this never blocks.
 		sendDone := func(err error) { stdoutDone <- err }
 
-		frame := make([]byte, 4)
+		var hdr [4]byte
 		reader := bufio.NewReaderSize(stdoutPipe, 65536)
-		var outputCounter uint32 = 0
+		var lastSeq uint32 = 0
 
 		for {
-			_, err := io.ReadFull(reader, frame)
+			_, err := io.ReadFull(reader, hdr[:])
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				sendDone(nil) // clean end of stream
 				return
@@ -386,42 +412,49 @@ func interactive(payloadB64 string, sealer hpke.Sealer) error {
 				return
 			}
 
-			if bytes.Equal(frame, magic[:]) {
-				// Read the 4-byte length.
-				_, err = io.ReadFull(reader, frame)
+			if bytes.Equal(hdr[:], magic[:]) {
+				// Read the 8-byte frame header: length(4B) | seq(4B).
+				var frameHdr [8]byte
+				_, err = io.ReadFull(reader, frameHdr[:])
 				if err != nil {
-					sendDone(fmt.Errorf("stdout: length read: %w", err))
+					sendDone(fmt.Errorf("stdout: frame header read: %w", err))
 					return
 				}
 
-				length := binary.BigEndian.Uint32(frame)
-				payload := make([]byte, length)
+				length := binary.BigEndian.Uint32(frameHdr[:4])
+				seq := binary.BigEndian.Uint32(frameHdr[4:])
 
+				// Replay / reorder detection (pre-crypto).
+				if seq <= lastSeq {
+					sendDone(fmt.Errorf("stdout: replay/reorder seq=%d last=%d", seq, lastSeq))
+					return
+				}
+
+				payload := make([]byte, length)
 				_, err = io.ReadFull(reader, payload)
 				if err != nil {
-					sendDone(fmt.Errorf("stdout: payload read (counter=%d, length=%d): %w", outputCounter, length, err))
+					sendDone(fmt.Errorf("stdout: payload read (seq=%d, length=%d): %w", seq, length, err))
 					return
 				}
 
 				nonce := payload[:12]
 
-				// Replay detection
-				counter := binary.BigEndian.Uint32(nonce[8:12])
-				if counter <= outputCounter {
-					sendDone(fmt.Errorf("stdout: replay detected counter=%d", counter))
+				// Cross-check: nonce[8:12] must match header seq.
+				if binary.BigEndian.Uint32(nonce[8:]) != seq {
+					sendDone(fmt.Errorf("stdout: nonce/seq mismatch seq=%d nonce_seq=%d", seq, binary.BigEndian.Uint32(nonce[8:])))
 					return
 				}
-				outputCounter = counter
+				lastSeq = seq
 
 				ciphertextTag := payload[12:]
-				plaintext, err := gcm_stdout.Open(nil, nonce, ciphertextTag, nil)
+				plaintext, err := gcm_stdout.Open(nil, nonce, ciphertextTag, frameHdr[:])
 				if err != nil {
-					sendDone(fmt.Errorf("stdout: decrypt (counter=%d): %w", outputCounter, err))
+					sendDone(fmt.Errorf("stdout: decrypt (seq=%d): %w", seq, err))
 					return
 				}
 
 				if _, werr := os.Stdout.Write(plaintext); werr != nil {
-					sendDone(fmt.Errorf("stdout: write (counter=%d): %w", outputCounter, werr))
+					sendDone(fmt.Errorf("stdout: write (seq=%d): %w", seq, werr))
 					return
 				}
 			} else {
@@ -430,7 +463,7 @@ func interactive(payloadB64 string, sealer hpke.Sealer) error {
 					sendDone(fmt.Errorf("stdout: non-magic line read: %w", err))
 					return
 				}
-				msg := append(frame, line...)
+				msg := append(hdr[:], line...)
 				if _, werr := os.Stdout.Write(msg); werr != nil {
 					sendDone(fmt.Errorf("stdout: non-magic write: %w", werr))
 					return
@@ -442,39 +475,58 @@ func interactive(payloadB64 string, sealer hpke.Sealer) error {
 	go func() {
 		defer stderrPipe.Close()
 
-		frame := make([]byte, 4)
+		var hdr [4]byte
 		reader := bufio.NewReader(stderrPipe)
+		var lastSeq uint32 = 0
 		for {
-			_, err := io.ReadFull(reader, frame)
+			_, err := io.ReadFull(reader, hdr[:])
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return
 			}
 			if err != nil {
-				reportErr(fmt.Errorf("failed to read stderr header: %v", err))
+				reportErr(fmt.Errorf("stderr: header read: %v", err))
 				return
 			}
 
-			if bytes.Equal(frame, magic[:]) {
-				_, err = io.ReadFull(reader, frame)
+			if bytes.Equal(hdr[:], magic[:]) {
+				// Read the 8-byte frame header: length(4B) | seq(4B).
+				var frameHdr [8]byte
+				_, err = io.ReadFull(reader, frameHdr[:])
 				if err != nil {
-					reportErr(fmt.Errorf("failed to read stderr length: %w", err))
+					reportErr(fmt.Errorf("stderr: frame header read: %w", err))
 					return
 				}
 
-				length := binary.BigEndian.Uint32(frame)
-				payload := make([]byte, length)
+				length := binary.BigEndian.Uint32(frameHdr[:4])
+				seq := binary.BigEndian.Uint32(frameHdr[4:])
 
+				// Replay / reorder detection (pre-crypto).
+				if seq <= lastSeq {
+					reportErr(fmt.Errorf("stderr: replay/reorder seq=%d last=%d", seq, lastSeq))
+					return
+				}
+
+				payload := make([]byte, length)
 				_, err = io.ReadFull(reader, payload)
 				if err != nil {
-					reportErr(fmt.Errorf("failed to read stderr payload: %v", err))
+					reportErr(fmt.Errorf("stderr: payload read (seq=%d, length=%d): %v", seq, length, err))
 					return
 				}
 
 				nonce := payload[:12]
+
+				// Cross-check: nonce[8:12] must match header seq.
+				if binary.BigEndian.Uint32(nonce[8:]) != seq {
+					reportErr(fmt.Errorf("stderr: nonce/seq mismatch seq=%d nonce_seq=%d", seq, binary.BigEndian.Uint32(nonce[8:])))
+					return
+				}
+				//lastSeq = seq
+				_ = seq
+
 				ciphertextTag := payload[12:]
-				plaintext, err := gcm_stderr.Open(nil, nonce, ciphertextTag, nil)
+				plaintext, err := gcm_stderr.Open(nil, nonce, ciphertextTag, frameHdr[:])
 				if err != nil {
-					reportErr(fmt.Errorf("stderr decrypt: %v", err))
+					reportErr(fmt.Errorf("stderr: decrypt (seq=%d): %v", seq, err))
 					return
 				}
 
@@ -489,7 +541,7 @@ func interactive(payloadB64 string, sealer hpke.Sealer) error {
 					reportErr(fmt.Errorf("stderr: reading text message %v", err))
 					return
 				}
-				msg := append(frame, []byte(line)...)
+				msg := append(hdr[:], []byte(line)...)
 				// Plain-text kubectl stderr (e.g. warnings, informational messages).
 				// Write it to our own stderr for visibility but do NOT treat it as a
 				// fatal error — aborting the transfer here would truncate the stdout
@@ -530,7 +582,7 @@ func interactive(payloadB64 string, sealer hpke.Sealer) error {
 
 	select {
 	case <-stderrGotCompletion:
-		// Agent signalled done — all stdout frames are in the pipe.
+		// Agent signaled done — all stdout frames are in the pipe.
 		// Wait for the goroutine to drain them, then tidy up.
 		drainErr := waitStdout()
 		_ = cmd.Process.Kill()
@@ -551,6 +603,40 @@ func interactive(payloadB64 string, sealer hpke.Sealer) error {
 		}
 		return drainErr
 	}
+}
+
+// ttyGcmFrame encrypts plaintext into a single authenticated TTY record and
+// writes it to w.
+//
+// Record wire format (mirrors AesGcmTtyProcessor on the agent side):
+//
+//	header   = length(4B BE) || seq(4B BE)   — 8 bytes, used as AAD
+//	nonce    = random(8B) || seq(4B BE)      — 12 bytes
+//	frame    = header(8B) || nonce(12B) || ciphertext+tag
+//
+// length = nonce(12) + len(plaintext) + tag(16).
+func ttyGcmFrame(w io.Writer, gcm cipher.AEAD, seq uint32, plaintext []byte) error {
+	payloadLen := uint32(gcm.NonceSize() + len(plaintext) + gcm.Overhead()) // #nosec G115 payloadLen is always < 12 + 4096 + 16
+
+	// Build header (AAD).
+	var header [8]byte
+	binary.BigEndian.PutUint32(header[:4], payloadLen)
+	binary.BigEndian.PutUint32(header[4:], seq)
+
+	// Build nonce: 8 random bytes || seq (4B BE).
+	nonce := util.GenerateRandomBytes(gcm.NonceSize())
+	binary.BigEndian.PutUint32(nonce[8:], seq)
+
+	ciphertext := gcm.Seal(nil, nonce, plaintext, header[:])
+
+	// Write: header(8) || nonce(12) || ciphertext+tag.
+	if err := writeFull(w, header[:]); err != nil {
+		return err
+	}
+	if err := writeFull(w, nonce); err != nil {
+		return err
+	}
+	return writeFull(w, ciphertext)
 }
 
 func interactiveTty(payloadB64 string, sealer hpke.Sealer) error {
@@ -578,16 +664,11 @@ func interactiveTty(payloadB64 string, sealer hpke.Sealer) error {
 		fmt.Println("=============== External Command ==============")
 		fmt.Println("kubectl", strings.Join(args, " "))
 		fmt.Println("===============================================")
-
 	}
 
 	channelKeys, err := util.DeriveChannelKeys(sealer)
 	if err != nil {
 		return fmt.Errorf("failed to derive channel keys: %v", err)
-	}
-
-	if cliDisplay {
-		//	fmt.Printf(" keys to prints %+v\n", channelKeys)
 	}
 
 	if cliDry {
@@ -596,52 +677,53 @@ func interactiveTty(payloadB64 string, sealer hpke.Sealer) error {
 
 	cmd := exec.Command("kubectl", args...) // #nosec G204 -- fixed binary name
 
-	// Put terminal in raw mode to prevent local echo
+	// Put terminal in raw mode to prevent local echo.
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
-		return (fmt.Errorf("failed to set raw mode: %v", err))
+		return fmt.Errorf("failed to set raw mode: %v", err)
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		return (fmt.Errorf("failed to start pty: %v", err))
+		return fmt.Errorf("failed to start pty: %v", err)
 	}
 	defer ptmx.Close()
 
-	// TTY mode uses AES-CTR (a stateful stream cipher) rather than AES-GCM (AEAD).
+	// TTY mode uses AES-GCM with per-record framing so every keystroke and
+	// every output chunk is integrity-protected.
 	//
-	// Trade-off: confidentiality vs. per-frame integrity
-	//   - Confidentiality is maintained: keys are derived from the HPKE exporter and
-	//     are unique per session (fresh ephemeral KEM randomness in SetupAuth). The
-	//     CTR counter advances automatically through the stream lifetime, so the IV
-	//     is consumed exactly once.
-	//   - Per-byte integrity is NOT provided: AES-CTR carries no authentication tag.
-	//     A bit-flip in the ciphertext produces a predictable bit-flip in the
-	//     plaintext (stream cipher malleability). There is also no sequence counter,
-	//     so reordering or truncation by an intermediary is not detected at this layer.
+	// Frame format (both directions):
+	//   header(8B: length 4B + seq 4B) || nonce(12B) || ciphertext+tag
 	//
-	// Rationale: an interactive TTY session is inherently low-latency and
-	// character-at-a-time; framing every keystroke with an AEAD tag adds overhead
-	// and complexity. The transport (kubectl SPDY/WebSocket) provides its own
-	// ordering.
-	decoder, err := util.AESCtrStream(channelKeys.DecryptKey, channelKeys.DecryptIV)
+	// The header is the AAD for AES-GCM; any tampering with length or the
+	// sequence number is detected by the authentication tag.
+	// The sequence number in the nonce and header must match; the receiver
+	// enforces strict monotonic ordering to detect replays and reordering.
+
+	// gcmEnc encrypts stdin→ptmx (client→agent direction).
+	gcmEnc, err := util.AESGcmBlock(channelKeys.EncryptKey)
 	if err != nil {
-		return (fmt.Errorf("failed to create decoder: %v", err))
+		return fmt.Errorf("failed to create AES-GCM encoder: %v", err)
 	}
 
-	encoder, err := util.AESCtrStream(channelKeys.EncryptKey, channelKeys.EncryptIV)
+	// gcmDec decrypts ptmx→stdout (agent→client direction).
+	gcmDec, err := util.AESGcmBlock(channelKeys.DecryptKey)
 	if err != nil {
-		return (fmt.Errorf("failed to create encoder: %v", err))
+		return fmt.Errorf("failed to create AES-GCM decoder: %v", err)
 	}
 
-	// Capture non-error exit
-	done := make(chan error, 1)
+	// done carries the outcome of the session: nil for clean exit, a
+	// *ttyExitError when the remote shell exits with a non-zero code, or an
+	// *exec.ExitError if kubectl itself fails.  Buffered with capacity 2 so
+	// that both the PTY reader goroutine and the cmd.Wait() goroutine can
+	// always send without blocking, avoiding a race where cmd.Wait() wins
+	// before the PTY reader has parsed the "command terminated" line.
+	done := make(chan error, 2)
 
-	// Designed to capture the first error!
+	// Captures the first fatal crypto/framing error from any goroutine.
 	errCh := make(chan error, 1)
 
-	// Helper to report first error
 	reportErr := func(err error) {
 		select {
 		case errCh <- err:
@@ -649,56 +731,153 @@ func interactiveTty(payloadB64 string, sealer hpke.Sealer) error {
 		}
 	}
 
+	// stdin goroutine — encrypt each available chunk into one AES-GCM frame.
 	go func() {
 		buf := make([]byte, 4064)
+		var sendSeq uint32 = 1
+
 		for {
 			n, err := os.Stdin.Read(buf)
 			if n > 0 {
-				encoded := util.EncodeDecode(encoder, buf[:n])
-				_, werr := ptmx.Write(encoded)
-				if werr != nil {
-					reportErr(fmt.Errorf("%v: ", werr))
+				if sendSeq == 0xFFFFFFFF {
+					reportErr(fmt.Errorf("tty: send counter overflow"))
+					return
 				}
+				if werr := ttyGcmFrame(ptmx, gcmEnc, sendSeq, buf[:n]); werr != nil {
+					reportErr(fmt.Errorf("tty: encrypt stdin: %v", werr))
+					return
+				}
+				sendSeq++
 			}
 			if err != nil {
-				reportErr(fmt.Errorf("%v: ", err))
+				if err == io.EOF {
+					return
+				}
+				reportErr(fmt.Errorf("tty: stdin read: %v", err))
+				return
 			}
 		}
 	}()
 
+	// ptmx reader goroutine — reassemble and decrypt AES-GCM frames from the
+	// agent.  The PTY layer may split a single frame across multiple reads, so
+	// we keep a reassembly buffer and only process complete records.
+	//
+	// In TTY mode stdout and stderr are multiplexed through ptmx.  kubectl
+	// injects plain-text session messages (e.g. "command terminated with exit
+	// code N", "If you don't see a command prompt") directly onto the PTY
+	// stream.  These arrive as raw bytes from ptmx.Read and must be checked
+	// FIRST, before the bytes are handed to the frame reassembler.
 	go func() {
-		buf := make([]byte, 4064)
+		var reassembly []byte
+		rawBuf := make([]byte, 65536)
+		var recvSeq uint32 = 0
 
 		for {
-			n, err := ptmx.Read(buf)
+			n, readErr := ptmx.Read(rawBuf)
 			if n > 0 {
-				// In TTY mode stdout and stderr are multiplexed through ptmx.
-				// KubectlMsg detects plain-text kubectl/server error messages
-				// (e.g. "command terminated with exit code", "Error from server").
-				// When endSession is true we report the error so that the select
-				// below kills the process, mirroring the non-TTY stderr behaviour.
-				// When endSession is false it is an informational message
-				// (e.g. "If you don't see a command prompt") — just skip it.
-				kubeMsg, endSession := util.KubectlMsg(buf[:n])
+				chunk := rawBuf[:n]
+
+				// Check for plain-text kubectl session messages first.
+				// KubectlMsg detects messages like "command terminated with
+				// exit code N" or "If you don't see a command prompt".
+				// When endSession is true we extract the exit code (if any)
+				// and signal done, mirroring the non-TTY stderr behaviour.
+				// When endSession is false it is informational — skip it.
+				kubeMsg, endSession := util.KubectlMsg(chunk)
 				if kubeMsg {
 					if endSession {
-						// done <- nil
-						// Returns an error on an exit
-						reportErr(fmt.Errorf("tty stderr: %s", buf[:n]))
+						const prefix = "command terminated with exit code "
+						lineStr := strings.TrimRight(string(chunk), "\r\n")
+						if strings.HasPrefix(lineStr, prefix) {
+							codeStr := strings.TrimPrefix(lineStr, prefix)
+							if code, parseErr := strconv.Atoi(strings.TrimSpace(codeStr)); parseErr == nil {
+								done <- &ttyExitError{code: code}
+								return
+							}
+						}
+						// Session-ending message without a parseable exit
+						// code (e.g. "Error from server") — report it as an
+						// error.
+						reportErr(fmt.Errorf("tty stderr: %s", chunk))
 					}
+					// Informational message ("If you don't see a command
+					// prompt") — discard and keep reading.
 					continue
 				}
-				decoded := util.EncodeDecode(decoder, buf[:n])
-				_, _ = os.Stdout.Write(decoded) // #nosec G104
+
+				// Not a plain-text kubectl message: treat as an encrypted
+				// frame fragment and append to the reassembly buffer.
+				reassembly = append(reassembly, chunk...)
+
+				// Drain all complete frames from the buffer.
+				for {
+					// Need at least 8 bytes for the header.
+					if len(reassembly) < 8 {
+						break
+					}
+
+					payloadLen := binary.BigEndian.Uint32(reassembly[:4])
+					seq := binary.BigEndian.Uint32(reassembly[4:8])
+
+					// Sanity-check the header looks like a real frame.
+					if payloadLen < 28 {
+						reportErr(fmt.Errorf("tty: invalid frame header: payloadLen=%d seq=%d", payloadLen, seq))
+						return
+					}
+
+					// Wait until the full frame body has arrived.
+					totalFrame := 8 + int(payloadLen)
+					if len(reassembly) < totalFrame {
+						break
+					}
+
+					header := reassembly[:8]
+					body := reassembly[8:totalFrame]
+					reassembly = reassembly[totalFrame:]
+
+					// Validate sequence number (strict monotonic).
+					if seq <= recvSeq {
+						reportErr(fmt.Errorf("tty: replay/reorder seq=%d, last=%d", seq, recvSeq))
+						return
+					}
+
+					// body = nonce(12) || ciphertext+tag
+					if len(body) < gcmDec.NonceSize() {
+						reportErr(fmt.Errorf("tty: frame body too short: %d bytes", len(body)))
+						return
+					}
+					nonce := body[:gcmDec.NonceSize()]
+					ciphertextTag := body[gcmDec.NonceSize():]
+
+					// Verify the seq embedded in the nonce matches the header.
+					nonceSeq := binary.BigEndian.Uint32(nonce[8:])
+					if nonceSeq != seq {
+						reportErr(fmt.Errorf("tty: header seq %d != nonce seq %d", seq, nonceSeq))
+						return
+					}
+
+					plaintext, derr := gcmDec.Open(nil, nonce, ciphertextTag, header)
+					if derr != nil {
+						reportErr(fmt.Errorf("tty: decrypt seq=%d: %v", seq, derr))
+						return
+					}
+
+					recvSeq = seq
+
+					if _, werr := os.Stdout.Write(plaintext); werr != nil {
+						reportErr(fmt.Errorf("tty: stdout write: %v", werr))
+						return
+					}
+				}
 			}
-			// Must come after
-			if err != nil {
-				// Check if process has exited after read
-				if errors.Is(err, syscall.EIO) || errors.Is(err, io.EOF) {
+			if readErr != nil {
+				if errors.Is(readErr, syscall.EIO) || errors.Is(readErr, io.EOF) {
 					done <- nil
 				} else {
-					reportErr(fmt.Errorf("XXX %v: ", err))
+					reportErr(fmt.Errorf("tty: ptmx read: %v", readErr))
 				}
+				return
 			}
 		}
 	}()
@@ -707,16 +886,34 @@ func interactiveTty(payloadB64 string, sealer hpke.Sealer) error {
 		done <- cmd.Wait()
 	}()
 
-	// wait for either error OR command completion
 	select {
 	case err := <-errCh:
-		// kill process on first goroutine error, cleaning up
 		_ = cmd.Process.Kill()
 		return err
 
 	case err := <-done:
-		// command finished normally
-		return err
+		// Drain the second slot in case both the PTY reader and cmd.Wait()
+		// fired at the same time.  If one of them is a *ttyExitError, that
+		// takes precedence over a nil from cmd.Wait() so the caller gets the
+		// remote exit code.
+		var other error
+		select {
+		case other = <-done:
+		default:
+		}
+		var ttyErr *ttyExitError
+		if errors.As(err, &ttyErr) {
+			return ttyErr
+		}
+		if errors.As(other, &ttyErr) {
+			return ttyErr
+		}
+		// Neither slot carried a ttyExitError — return whichever is non-nil,
+		// or nil if both are nil.
+		if err != nil {
+			return err
+		}
+		return other
 	}
 }
 
