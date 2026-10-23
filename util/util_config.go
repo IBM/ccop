@@ -50,7 +50,7 @@ type PodList struct {
 	} `json:"items"`
 }
 
-func CheckCCOPEnabled(nameSpace string, podName string, kbsAuthKey string) error {
+func CheckCCOPEnabled(nameSpace string, podName string, adminToken string) error {
 	args := []string{"get", "pod", "-o", "json", podName}
 
 	if nameSpace != "" {
@@ -105,7 +105,7 @@ func CheckCCOPEnabled(nameSpace string, podName string, kbsAuthKey string) error
 		return fmt.Errorf("pod %s: error: failed to parse data.ccop.toml: %w", podName, err)
 	}
 
-	if kbsAuthKey != "" {
+	if adminToken != "" {
 		cdhToml, ok := initData.Data["cdh.toml"]
 		if !ok {
 			return fmt.Errorf("\tcdh.toml: not found")
@@ -116,14 +116,14 @@ func CheckCCOPEnabled(nameSpace string, podName string, kbsAuthKey string) error
 			return fmt.Errorf("\tcdh.toml.url: not found %v", err)
 		}
 
-		err = retrieve_agent_cert(nameSpace, podName, kbsUrl, kbsAuthKey)
+		err = retrieve_agent_cert(nameSpace, podName, kbsUrl, adminToken)
 		if err != nil {
 			return fmt.Errorf("\terror: retrieving agent cert %v", err)
 		}
 
-		err = retrieve_random_bytes(nameSpace, podName, kbsUrl, kbsAuthKey)
+		err = retrieve_symmetric_key(nameSpace, podName, kbsUrl, adminToken)
 		if err != nil {
-			return fmt.Errorf("\terror: retrieving random bytes %v", err)
+			return fmt.Errorf("\terror: retrieving symmetric key %v", err)
 		}
 	}
 
@@ -332,38 +332,32 @@ func cdhTomlKbsUrl(data string) (string, string, error) {
 	return strings.TrimSpace(parsed.KBC.Name), strings.TrimSpace(parsed.KBC.URL), nil
 }
 
-func retrieve_agent_cert(ns string, podName string, kbsUrl string, authKeyFile string) error {
+func retrieve_agent_cert(ns string, podName string, kbsUrl string, adminToken string) error {
 
 	// Save to ~/.ccop/cache/<ns>_<pod>/receiver.crt
 	if podName == "" {
 		return fmt.Errorf("pod name must be specified (for cache path)")
 	}
 
-	// Fixed query string: secret_name=ccop_p256 secret_type=p256
-	query := fmt.Sprintf("name=%s&ns=%s&secret_name=ccop_p256&secret_type=p256", podName, ns)
-
-	// Read the admin private key
-	authKeyPEM, err := os.ReadFile(authKeyFile) // #nosec G304 -- path supplied by trusted caller
-	if err != nil {
-		return fmt.Errorf("failed to read auth key file")
-	}
+	// secret_type=cert&kind=self_signed_ca&algorithm=ec_p256 per the credgen plugin API.
+	query := fmt.Sprintf("name=%s&ns=%s&secret_name=ccop_p256&secret_type=cert&kind=self_signed_ca&algorithm=ec_p256", podName, ns)
 
 	// Fetch from KBS
-	secret, err := FetchClientCreds(kbsUrl, string(authKeyPEM), query)
+	secret, err := FetchClientCreds(kbsUrl, adminToken, query)
 	if err != nil {
 		return fmt.Errorf("failed to fetch client credentials")
 	}
 
-	if secret.MaterialType != "P256" {
-		return fmt.Errorf("expected P256 material, got %q; ", secret.MaterialType)
+	if secret.MaterialType != "Cert" {
+		return fmt.Errorf("expected Cert material, got %q", secret.MaterialType)
 	}
 
-	certPEM := secret.CertPEM
+	certPEM := secret.Cert
 	if len(certPEM) == 0 {
-		return fmt.Errorf("server returned a P256 secret with empty cert_pem")
+		return fmt.Errorf("server returned a Cert secret with empty cert")
 	}
 
-	certPath, err := SaveCertToCache(ns, podName, certPEM)
+	certPath, err := SaveCertToCache(ns, podName, []byte(certPEM))
 	if err != nil {
 		return fmt.Errorf("failed to save certificate to cache: %w", err)
 	}
@@ -372,41 +366,34 @@ func retrieve_agent_cert(ns string, podName string, kbsUrl string, authKeyFile s
 	return nil
 }
 
-func retrieve_random_bytes(ns string, podName string, kbsUrl string, authKeyFile string) error {
+func retrieve_symmetric_key(ns string, podName string, kbsUrl string, adminToken string) error {
 
 	if podName == "" {
 		return fmt.Errorf("pod name must be specified (for cache path)")
 	}
 
-	// Fixed query string: secret_name=ccop_random secret_type=random
-	query := fmt.Sprintf("name=%s&ns=%s&secret_name=ccop_random&secret_type=random", podName, ns)
-
-	// Read the admin private key
-	authKeyPEM, err := os.ReadFile(authKeyFile) // #nosec G304 -- path supplied by trusted caller
-	if err != nil {
-		return fmt.Errorf("failed to read auth key file: %w", err)
-	}
+	query := fmt.Sprintf("name=%s&ns=%s&secret_name=ccop_symmetric&secret_type=symmetric", podName, ns)
 
 	// Fetch from KBS
-	secret, err := FetchClientCreds(kbsUrl, string(authKeyPEM), query)
+	secret, err := FetchClientCreds(kbsUrl, adminToken, query)
 	if err != nil {
-		return fmt.Errorf("failed to fetch random bytes: %w", err)
+		return fmt.Errorf("failed to fetch symmetric key: %w", err)
 	}
 
-	if secret.MaterialType != "Random" {
-		return fmt.Errorf("expected Random material, got %q", secret.MaterialType)
+	if secret.MaterialType != "Symmetric" {
+		return fmt.Errorf("expected Symmetric material, got %q", secret.MaterialType)
 	}
 
-	if len(secret.Bytes) == 0 {
-		return fmt.Errorf("server returned a Random secret with empty bytes")
+	if len(secret.Key) == 0 {
+		return fmt.Errorf("server returned a Symmetric secret with empty key")
 	}
 
-	filePath, err := SaveBytesToCache(ns, podName, "ccop_random.bin", secret.Bytes)
+	filePath, err := SaveBytesToCache(ns, podName, "ccop_symmetric.bin", []byte(secret.Key))
 	if err != nil {
-		return fmt.Errorf("failed to save random bytes to cache: %w", err)
+		return fmt.Errorf("failed to save symmetric key to cache: %w", err)
 	}
 
-	fmt.Printf("Random bytes saved to %s\n", filePath)
+	fmt.Printf("Symmetric key saved to %s\n", filePath)
 	return nil
 }
 

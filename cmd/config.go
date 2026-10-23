@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
@@ -20,10 +21,11 @@ import (
 
 // configCmd represents the config command
 var (
-	cliCr   bool
-	cliRe   bool
-	cliList bool
-	cliPr   bool
+	cliCr             bool
+	cliRe             bool
+	cliList           bool
+	cliPr             bool
+	cliAdminTokenFile string
 
 	configCmd = &cobra.Command{
 		Use:   "config",
@@ -35,23 +37,23 @@ confidential containers workloads. For example:
 ccop config -c
 
 # List running pods
-ccop config -l  
+ccop config -l
 
 # Check whether ccop is enabled for a running pod
-ccop config -l mypod 
+ccop config -l mypod
 
 # Review configuration settings, e.g., owner's public and private key pair
 ccop config -r
 
 # Retrieve mypod's artifacts from the key broker service (KBS) specified in
-# the initdata, requiring KBS's admin private key file. Artifacts include
-# public key certificate associated with sandbox environment ..., 
-# saving artifacts to the local cache 
+# the initdata, requiring a pre-issued KBS admin bearer token. Artifacts include
+# public key certificate associated with sandbox environment ...,
+# saving artifacts to the local cache
 
-ccop config  mypod --auth-key /path/to/private.key
+ccop config  mypod --admin-token-file /path/to/admin-token
 
 # Remove dated pod artifacts
-ccop config --prune 
+ccop config --prune
 
 `,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -73,7 +75,7 @@ func init() {
 	configCmd.PersistentFlags().BoolVarP(&cliPr, "prune", "", false, "Delete pod artifacts")
 
 	configCmd.PersistentFlags().StringVarP(&cliNameSpace, "namespace", "n", "default", "Namespace scope")
-	configCmd.PersistentFlags().StringVar(&cliFetchAuthKey, "auth-key", "", "Ed25519 admin private key file (PEM) for KBS authentication")
+	configCmd.PersistentFlags().StringVar(&cliAdminTokenFile, "admin-token-file", "", "Admin bearer token file for KBS authentication")
 }
 
 func processConfig(cmdargs []string) {
@@ -105,11 +107,16 @@ func processConfig(cmdargs []string) {
 		}
 	}
 
-	if cliFetchAuthKey != "" {
+	if cliAdminTokenFile != "" {
 		if cliPodName == "" {
 			log.Fatalf("pod error: pod-name required ")
 		}
-		if err := util.CheckCCOPEnabled(cliNameSpace, cliPodName, cliFetchAuthKey); err != nil {
+		tokenBytes, err := os.ReadFile(cliAdminTokenFile)
+		if err != nil {
+			log.Fatalf("failed to read admin token file %q: %v", cliAdminTokenFile, err)
+		}
+		adminToken := strings.TrimSpace(string(tokenBytes))
+		if err := util.CheckCCOPEnabled(cliNameSpace, cliPodName, adminToken); err != nil {
 			log.Fatalf("retrieve error: %v", err)
 		}
 

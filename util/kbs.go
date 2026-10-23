@@ -6,95 +6,72 @@
 package util
 
 import (
-	"crypto/ed25519"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
-	"time"
 )
 
 const kbsURLPrefix = "kbs/v0"
-const adminTokenExpirySecs = 7200
 
-// ClientSecret mirrors the JSON returned by the secretprov client_creds endpoint.
-// The material_type tag drives which fields are populated; for P256 the
-// public material is in CertPEM, for Random it is in Bytes.
+// IntBytes is a []byte that deserialises from a JSON array of integers,
+// which is how Rust's serde serialises Vec<u8>.
+// Example wire format: [45, 45, 66, 69, 71, 73, 78, ...]
+type IntBytes []byte
+
+func (b *IntBytes) UnmarshalJSON(data []byte) error {
+	var ints []int
+	if err := json.Unmarshal(data, &ints); err != nil {
+		return fmt.Errorf("IntBytes: expected JSON array of integers: %w", err)
+	}
+	*b = make([]byte, len(ints))
+	for i, v := range ints {
+		(*b)[i] = byte(v)
+	}
+	return nil
+}
+
+// ClientSecret mirrors the JSON returned by the credgen client_creds endpoint.
+//
+// The plugin serialises all byte fields as JSON arrays of integers (Rust
+// serde's default for Vec<u8>), so every byte field uses IntBytes rather than
+// []byte. The material_type tag identifies which fields are populated:
+//
+//	"Cert"       → Cert (+ PrivateKey, CACert for kind "leaf_cert")
+//	"Asymmetric" → PublicKey
+//	"Symmetric"  → Key
+//
+// Kind is set for certs only; Algorithm for certs and asymmetric keys.
 type ClientSecret struct {
 	SecretName   string `json:"secret_name"`
 	SecretType   string `json:"secret_type"`
+	Kind         string `json:"kind,omitempty"`
+	Algorithm    string `json:"algorithm,omitempty"`
 	MaterialType string `json:"material_type"`
-	// P256
-	CertPEM []byte `json:"cert_pem,omitempty"`
+	// Cert (PrivateKey and CACert only for kind "leaf_cert")
+	PrivateKey IntBytes `json:"private_key,omitempty"`
+	Cert       IntBytes `json:"cert,omitempty"`
+	CACert     IntBytes `json:"ca_cert,omitempty"`
+	// Asymmetric
+	PublicKey IntBytes `json:"public_key,omitempty"`
 	// Symmetric
-	Key []byte `json:"key,omitempty"`
-	// Random
-	Bytes []byte `json:"bytes,omitempty"`
-	// TLS / Ed25519 / RSA public material
-	PublicKey  []byte `json:"public_key,omitempty"`
-	PrivateKey []byte `json:"private_key,omitempty"`
-	Cert       []byte `json:"cert,omitempty"`
-	CACert     []byte `json:"ca_cert,omitempty"`
+	Key IntBytes `json:"key,omitempty"`
 }
 
-// signAdminToken produces a minimal EdDSA JWT (header.claims.sig) signed
-// with the Ed25519 private key read from keyPEM. No third-party JWT library
-// is required — the format is simple enough to build by hand.
-func signAdminToken(keyPEM string) (string, error) {
-	block, _ := pem.Decode([]byte(keyPEM))
-	if block == nil {
-		return "", fmt.Errorf("failed to decode PEM block from auth key")
-	}
-
-	pkcs8Key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse PKCS8 private key: %w", err)
-	}
-
-	ed25519Key, ok := pkcs8Key.(ed25519.PrivateKey)
-	if !ok {
-		return "", fmt.Errorf("auth key is not an Ed25519 private key")
-	}
-
-	now := time.Now().Unix()
-
-	// Header: {"alg":"EdDSA","typ":"JWT"}
-	headerJSON := `{"alg":"EdDSA","typ":"JWT"}`
-	// Claims: {"iat":<now>,"exp":<now+7200>}
-	claimsJSON := fmt.Sprintf(`{"iat":%d,"exp":%d}`, now, now+adminTokenExpirySecs)
-
-	headerB64 := base64.RawURLEncoding.EncodeToString([]byte(headerJSON))
-	claimsB64 := base64.RawURLEncoding.EncodeToString([]byte(claimsJSON))
-
-	signingInput := headerB64 + "." + claimsB64
-	sig := ed25519.Sign(ed25519Key, []byte(signingInput))
-	sigB64 := base64.RawURLEncoding.EncodeToString(sig)
-
-	return signingInput + "." + sigB64, nil
-}
-
-// FetchClientCreds calls POST kbs/v0/secretprov/client_creds?<query> and returns
-// the parsed ClientSecret. authKeyPEM is the Ed25519 private key used to sign
-// the admin JWT. kbsURL is the KBS server root URL (e.g. "http://host:8090").
-func FetchClientCreds(kbsURL string, authKeyPEM string, query string) (*ClientSecret, error) {
-	token, err := signAdminToken(authKeyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("failed to sign admin token: %w", err)
-	}
-
-	url := fmt.Sprintf("%s/%s/secretprov/client_creds?%s", kbsURL, kbsURLPrefix, query)
+// FetchClientCreds calls POST kbs/v0/credgen/client_creds?<query> and returns
+// the parsed ClientSecret. adminToken is the pre-issued KBS admin bearer token.
+// kbsURL is the KBS server root URL (e.g. "http://host:8090").
+func FetchClientCreds(kbsURL string, adminToken string, query string) (*ClientSecret, error) {
+	url := fmt.Sprintf("%s/%s/credgen/client_creds?%s", kbsURL, kbsURLPrefix, query)
 
 	req, err := http.NewRequest(http.MethodPost, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

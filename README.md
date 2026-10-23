@@ -12,7 +12,7 @@ Additionally, per-session stream keys are derived from the same HPKE context and
 <!--
  Follow the instructions for [building a customized CoCo image supporting `cc-op`](https://github.ibm.com/rvaldez/coco/blob/main/ROOTIMAGE.md). 
 --> 
-2. Trustee is deployed running a [Key Broker Service](https://github.com/salmanyam/trustee/blob/splitapi-plugin/kbs/docs/plugins/secretprov.md) implementing the `SecretProv` Plugin. This plugin dynamically generates cryptographic credentials for confidential VMs.
+2. Trustee is deployed running a [Key Broker Service](https://github.com/salmanyam/trustee/blob/2b011e9ba0e2bf50533be66e6e58aa77071558d4/kbs/docs/plugins/credgen.md) implementing the `credgen` Plugin. This plugin dynamically generates cryptographic credentials for confidential VMs.
 
 ## Getting Started
 - Build ccop tool
@@ -73,13 +73,13 @@ Additionally, per-session stream keys are derived from the same HPKE context and
    $ CERTDATA=$(cat cert.crt)
    ```
 
-- Set shell variables to KBS URL and admin private key file (PEM)
+- Set shell variables to KBS URL and admin bearer token file
    ```
    $ export KBS_URL=<KBS_SERVER_URL>
-   $ export KBS_PRIVATE_KEY=/path/to/kbs_private.key
+   $ export KBS_ADMIN_TOKEN=/path/to/admin-token
    ```
 
-- Create initdata with an agent policy that blocks all exec operations and a ccop config file (ccop.toml) containing the user's public certificate (`auth_cert`). This embedded config file enables cc-op for the workload.
+- Create initdata with an agent policy that blocks all exec operations and a ccop config file (ccop.toml) containing the user's public certificate (`auth_cert`). This embedded config file enables cc-op for the workload. We also need to specify the `name` and `namespace` in the initdata to make sure that the credential generator plugin (`credgen`) verifies the pod name and namespace to make sure the request comes from the legitimate owner.
 
    ```
    $ tee > initdata.toml <<EOF
@@ -147,6 +147,9 @@ Additionally, per-session stream keys are derived from the same HPKE context and
    name = "cc_kbc"
    url = "${KBS_URL}"
    '''
+   "name" = "pod-busybox-exec"
+   "ns"   = "default"
+
    EOF
    ```
 
@@ -200,9 +203,9 @@ Additionally, per-session stream keys are derived from the same HPKE context and
 -  Fetch the pod's public key certificate from Trustee (KBS) and save in `./receiver.crt`
 
    ```
-   $ ccop fetch --url "${KBS_URL}" --auth-key "${KBS_PRIVATE_KEY}" \
-   --namespace default --pod pod-busybox-exec \
-   secret_name=ccop_p256 secret_type=p256 --out ./receiver.crt
+   $ ccop fetch --url "${KBS_URL}" --admin-token-file "${KBS_ADMIN_TOKEN}" --namespace default \
+   --pod pod-busybox-exec secret_name=ccop_p256 secret_type=cert kind=self_signed_ca \
+   algorithm=ec_p256 --out ./receiver.crt
    ```
 
 - Run `ccop exec`, specifying `--privkey` for the user's private key; and  `--pubkeycert` for the pod's public certificate; it successfully executes
@@ -212,7 +215,7 @@ Additionally, per-session stream keys are derived from the same HPKE context and
    ```
 
 ## ccop Configuration
-The `ccop config` command manages and displays the ccop environment. It always requires an option (`--auth-key`, `-c`, or `-l` ).
+The `ccop config` command manages and displays the ccop environment. It always requires an option (`--admin-token-file`, `-c`, or `-l` ).
 
 #### Generate a configuration: 
    ```
@@ -230,7 +233,7 @@ The `ccop config` command manages and displays the ccop environment. It always r
 
 #### Retrieve mypod's artifacts from Trustee (KBS) and save in cache directory:
    ```
-   $ ccop config mypod --auth-key "${KBS_PRIVATE_KEY}"
+   $ ccop config mypod --admin-token-file "${KBS_ADMIN_TOKEN}"
    ```
 - Extracts KBS's URL from the running pod's initdata.
 - Retrieves artifacts, including the public key certificate associated with sandbox environment ... 
