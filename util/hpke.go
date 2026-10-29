@@ -193,7 +193,7 @@ func DeriveChannelKeysFromOpener(opener hpke.Opener) (*ChannelKeys, error) {
 // deriveAttachKeys derives independent block_key (32B), stream_key (32B), and iv (16B)
 // from ikm using HKDF-SHA256 with distinct info strings, matching the Rust get_init_crypto
 // implementation in cc-op/src/lib.rs.
-func DeriveAttachLogsKeys(ikm []byte) (blockKey, streamKey, iv []byte, err error) {
+func DeriveAttachLogsKeys(ikm []byte) (inKey, outKey []byte, err error) {
 	expand := func(info string, length int) ([]byte, error) {
 		r := hkdf.New(sha256.New, ikm, nil, []byte(info))
 		out := make([]byte, length)
@@ -203,13 +203,13 @@ func DeriveAttachLogsKeys(ikm []byte) (blockKey, streamKey, iv []byte, err error
 		return out, nil
 	}
 
-	if blockKey, err = expand("ccop attach logs block-key v1", 32); err != nil {
+	if inKey, err = expand("ccop attach logs in_key v1", 32); err != nil {
 		return
 	}
-	if streamKey, err = expand("ccop attach logs stream-key v1", 32); err != nil {
+	if outKey, err = expand("ccop attach logs out_key v1", 32); err != nil {
 		return
 	}
-	iv, err = expand("ccop attach logs iv v1", 16)
+
 	return
 }
 

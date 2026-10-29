@@ -1,17 +1,15 @@
 # Confidential Operations (ccop)
 
-ccop is a command-line tool that enables security-sensitive Kubernetes operations within a Confidential Containers (CoCo) deployment. The initial release supports `kubectl exec`. It wraps `exec` command arguments in a Hybrid Public Key Encryption (HPKE) Auth-mode envelope using a user's private key and a public key provisioned to the workload at startup.  This cryptographically binds the user's identity to the `exec` request and locks command decryption and verification to the workload with the corresponding credential.
+ccop is a command-line tool that enables security-sensitive Kubernetes operations within a Confidential Containers (CoCo) deployment. The current release supports `kubectl exec` and `kubectl cp`. It wraps `exec` command arguments in a Hybrid Public Key Encryption (HPKE) Auth-mode envelope using a user's private key and a public key provisioned to the workload at startup.  This cryptographically binds the user's identity to the `exec` request and locks command decryption and verification to the workload with the corresponding credential.
+
+`ccop cp` is built on `ccop exec`: it streams `tar` archives through authenticated `ccop exec` sessions, so file transfers get the same protection as commands.
 
 Additionally, per-session stream keys are derived from the same HPKE context and are used to encrypt all stdin/stdout/stderr traffic end-to-end, so neither the host OS, the container runtime, nor the Kubernetes control plane can observe or tamper with operational data.
 
 ## Assumptions
-1. The Kubernetes cluster has a container runtime, e.g., `kata-qemu-snp-ccop`, with `agent-policy` and `cc-op` features enabled.
+1. The Kubernetes cluster has a [Kata Containers VM root runtime supporting cc-op](https://github.com/ray-valdez/kata-containers/tree/ccop-pr), e.g., `kata-qemu-snp-ccop`.
    > [!IMPORTANT]
    > A key requirement is that the runtime's root image is compiled with both `AGENT_POLICY=yes` and `CC_OP=yes` options enabled. 
- <!-- - k8s cluster configured with the cc-op enabled runtime class is accessible. -->
-<!--
- Follow the instructions for [building a customized CoCo image supporting `cc-op`](https://github.ibm.com/rvaldez/coco/blob/main/ROOTIMAGE.md). 
---> 
 2. Trustee is deployed running a [Key Broker Service](https://github.com/salmanyam/trustee/blob/2b011e9ba0e2bf50533be66e6e58aa77071558d4/kbs/docs/plugins/credgen.md) implementing the `credgen` Plugin. This plugin dynamically generates cryptographic credentials for confidential VMs.
 
 ## Getting Started
@@ -79,7 +77,17 @@ Additionally, per-session stream keys are derived from the same HPKE context and
    $ export KBS_ADMIN_TOKEN=/path/to/admin-token
    ```
 
-- Create initdata with an agent policy that blocks all exec operations and a ccop config file (ccop.toml) containing the user's public certificate (`auth_cert`). This embedded config file enables cc-op for the workload. We also need to specify the `name` and `namespace` in the initdata to make sure that the credential generator plugin (`credgen`) verifies the pod name and namespace to make sure the request comes from the legitimate owner.
+- Set shell variables to the pod name and namespace used in the pod configuration deployed below (this example uses `pod-busybox-exec` and `default`):
+   ```
+   $ export PODNAME=pod-busybox-exec
+   $ export NAMESPACE=default
+   ```
+
+
+- Create initdata with an agent policy that blocks all exec operations and a ccop config file (`ccop.toml`) containing the user's public certificate (`auth_cert`). The embedded config file enables cc-op for the workload.
+
+   > [!NOTE]
+   > The initdata must also specify the pod's `name` and `ns` (namespace). The credential generator plugin (`credgen`) uses them to verify that a credential request comes from the pod that owns them. They must match the pod's `metadata.name` and namespace.
 
    ```
    $ tee > initdata.toml <<EOF
@@ -147,8 +155,9 @@ Additionally, per-session stream keys are derived from the same HPKE context and
    name = "cc_kbc"
    url = "${KBS_URL}"
    '''
-   "name" = "pod-busybox-exec"
-   "ns"   = "default"
+
+   "name" = "${PODNAME}"
+   "ns"   = "${NAMESPACE}"
 
    EOF
    ```
@@ -161,7 +170,8 @@ Additionally, per-session stream keys are derived from the same HPKE context and
    apiVersion: v1
    kind: Pod
    metadata:
-     name: pod-busybox-exec
+     name: ${PODNAME}
+     namespace: ${NAMESPACE}
      annotations:
        io.containerd.cri.runtime-handler: kata-qemu-snp-ccop
        io.katacontainers.config.hypervisor.cc_init_data: ${INITDATA}
@@ -189,7 +199,8 @@ Additionally, per-session stream keys are derived from the same HPKE context and
    ...
    ```
    > **Note:** the create pod sandbox operation fails if the pod is unable to retrieve
-   > its credential from Trustee.
+   > its credential from Trustee. This also happens if the `name`/`ns` in the initdata
+   > don't match the pod's actual name and namespace.
 
 -  Execute the original `kubectl exec`; it fails
    ```
@@ -203,8 +214,8 @@ Additionally, per-session stream keys are derived from the same HPKE context and
 -  Fetch the pod's public key certificate from Trustee (KBS) and save in `./receiver.crt`
 
    ```
-   $ ccop fetch --url "${KBS_URL}" --admin-token-file "${KBS_ADMIN_TOKEN}" --namespace default \
-   --pod pod-busybox-exec secret_name=ccop_p256 secret_type=cert kind=self_signed_ca \
+   $ ccop fetch --url "${KBS_URL}" --admin-token-file "${KBS_ADMIN_TOKEN}" --namespace "${NAMESPACE}" \
+   --pod "${PODNAME}" secret_name=ccop_p256 secret_type=cert kind=self_signed_ca \
    algorithm=ec_p256 --out ./receiver.crt
    ```
 
@@ -213,6 +224,26 @@ Additionally, per-session stream keys are derived from the same HPKE context and
    $ ccop exec pod-busybox-exec --privkey ./key.priv --pubkeycert ./receiver.crt -- ls -C /
    bin   dev   etc   home  lib   proc  root  sys   tmp   usr   var
    ```
+
+## Test kubectl cp use case
+`ccop cp` copies files and directories to and from a pod, using the same keys and pod certificate as `ccop exec`. The pod above and its `./receiver.crt` can be reused.
+
+> [!IMPORTANT]
+> `ccop cp` requires the `sh` and `tar` binaries in the container image; it fails if they are not present.
+
+- Copy a local file into the pod
+   ```
+   $ echo "hello" > hello.txt
+   $ ccop cp hello.txt pod-busybox-exec:/tmp --privkey ./key.priv --pubkeycert ./receiver.crt
+   ```
+
+- Verify the file arrived
+   ```
+   $ ccop exec pod-busybox-exec --privkey ./key.priv --pubkeycert ./receiver.crt -- cat /tmp/hello.txt
+   hello
+   ```
+
+For other copy examples, e.g., copying from a pod or copying directories, run `ccop cp -h`.
 
 ## ccop Configuration
 The `ccop config` command manages and displays the ccop environment. It always requires an option (`--admin-token-file`, `-c`, or `-l` ).
@@ -233,16 +264,17 @@ The `ccop config` command manages and displays the ccop environment. It always r
 
 #### Retrieve mypod's artifacts from Trustee (KBS) and save in cache directory:
    ```
-   $ ccop config mypod --admin-token-file "${KBS_ADMIN_TOKEN}"
+   $ ccop config pod-busybox-exec --admin-token-file "${KBS_ADMIN_TOKEN}"
    ```
 - Extracts KBS's URL from the running pod's initdata.
 - Retrieves artifacts, including the public key certificate associated with sandbox environment ... 
 - This avoids specifying `--pubkeycert` on every command.
 
 With both the key paths and the certificate cached, all key flags can be omitted:
-```bash
+```
 $ ccop exec pod-busybox-exec -- ls -C /
 bin   dev   etc   home  lib   proc  root  sys   tmp   usr   var
+$ ccop cp hello.txt pod-busybox-exec:/tmp
 ```
 
 #### Report ccop status on all running pods:
@@ -278,5 +310,5 @@ Checks whether a pod's initdata contains a `ccop.toml` with an `auth_cert`.
 ## Future Work 
 - Support for other command-specific options: `-f`, `-q`, and `--pod-running-timeout`
 - Support for overriding any command inherited option 
-- Support for `cp`, `attach`, and `logs` is planned for follow-on release(s)
+- Support for `attach` and `logs` is planned for follow-on release(s)
 

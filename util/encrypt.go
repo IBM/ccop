@@ -123,22 +123,16 @@ func KubectlMsg(chunk []byte) (bool, bool) {
 	for _, b := range chunk {
 		if b == '\n' {
 			line := string(lineBuf)
-			//fmt.Printf("KubectlMsg: %s \n", line)
 
 			if strings.HasPrefix(line, "command terminated with exit code") {
-				fmt.Printf("%s", line)
 				return true, endSession
 			}
-			// starting exec terminal with -it
-			// starting attach
-			//if strings.HasPrefix(line, "If you don't see a command prompt, try pressing enter.") {
+
 			if strings.HasPrefix(line, "If you don't see a command prompt") {
-				fmt.Printf("%s", line)
 				return true, false
 			}
 
 			if strings.HasPrefix(line, "Error from server (NotFound)") {
-				fmt.Printf("%s", line)
 				return true, endSession
 			}
 
@@ -148,12 +142,10 @@ func KubectlMsg(chunk []byte) (bool, bool) {
 			}
 
 			if strings.HasPrefix(line, "error: error stream protocol error: unknown error") {
-				fmt.Printf("%s", line)
 				return true, endSession
 			}
 			// when the command is no found, e.g., /bin/foobar
 			if strings.HasPrefix(line, "error: Internal error occurred:") {
-				fmt.Printf("%s", line)
 				return true, endSession
 			}
 
