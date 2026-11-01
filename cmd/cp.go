@@ -125,7 +125,6 @@ func processCmdCpCcop(src string, dst string) {
 		if err != nil {
 			if os.IsNotExist(err) {
 				newDest = true
-				fmt.Println("new destination could dir or file")
 			} else {
 				log.Fatal(err)
 			}
